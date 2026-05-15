@@ -1,193 +1,202 @@
 /**
- * CF7 → LEADS SYNC
- * Source: WordPress CF7 + Google Sheets connector (one shared raw tab)
- * Dest:   Active Leads sheet
+ * CF7 → LEADS SYNC  (fully sheet-driven config)
  *
- * TRIGGERS TO SET UP:
- *   onNewCF7Row   → On change  (auto-adds checkbox when CF7 writes a new row)
- *   installableOnEdit → On edit   (fires when you tick the checkbox)
+ * TRIGGERS:
+ *   onNewCF7Row       → Time-driven, every minute   (auto-adds checkbox)
+ *   installableOnEdit → On edit                     (fires on checkbox tick)
+ *
+ * CONFIG TAB LAYOUT  ("CF7 Config" tab):
+ *
+ *   A              B                 D                 E               F
+ *   ─────────────────────           ──────────────────────────────────────────
+ *   Setting        Value             CF7 Raw Field     Leads Column    Default Value
+ *   (instruction row)                (instruction row)
+ *   Source Tab     CF7 Raw           fname             Contact Name
+ *   Dest Sheet ID  abc123...         phone             Phone Number
+ *   Dest Tab       Leads             ...               ...
+ *   Timezone       Australia/...
+ *   Follow Up Days 3
+ *   Dup Fields     Phone Number, Email Address
  */
 
 // ─────────────────────────────────────────────
-//  SECTION 1 — GLOBAL CONFIG
-//  Things you rarely change
+//  ONLY THING LEFT IN SCRIPT:
+//  The config tab name — everything else lives in the sheet
 // ─────────────────────────────────────────────
-const CF7_CONFIG = {
-  SOURCE_SHEET_ID:  SpreadsheetApp.getActiveSpreadsheet().getId(), // raw sheet (this file)
-  SOURCE_TAB_NAME:  'Website Forms',          // tab the WP connector writes into
-  SYNC_TRIGGER_COL: 'Sync to Leads',    // header of the checkbox column (auto-created)
-
-  DEST_SHEET_ID:    '',                 // ← paste destination spreadsheet ID
-  DEST_TAB_NAME:    'Leads',
-
-  TIMEZONE:         'Australia/Adelaide',
-  FOLLOW_UP_DAYS:   3,
-
-  // Fields checked for duplicates (matched against dest sheet)
-  DUP_FIELDS: ['Phone Number', 'Email Address'],
-};
+const CONFIG_TAB_NAME = '(Config)Website Forms';
 
 // ─────────────────────────────────────────────
-//  SECTION 2 — FIELD CONFIG
-//  Edit this when forms change.
-//
-//  Each entry:
-//    cf7Key   : exact column header the WP connector writes (CF7 field name)
-//    destCol  : matching column header in the Leads sheet
-//    transform: optional fn to clean/format the value (or null)
-//
-//  ORDER doesn't matter — matching is by header name.
-//  To ignore a CF7 field, simply omit it.
-//  To hard-code a dest value regardless of input, use the DEFAULTS section below.
+//  TRANSFORM HELPERS  (script-only, client never touches)
+//  Preserve leading zero on phone numbers
 // ─────────────────────────────────────────────
-const FIELD_MAP = [
-  // CF7 raw column        → Leads column          transform
-  { cf7Key: 'fname',        destCol: 'Contact Name',  transform: null },
-  { cf7Key: 'phone',        destCol: 'Phone Number',  transform: forcePhoneString },
-  { cf7Key: 'email',        destCol: 'Email Address', transform: null },
-  { cf7Key: 'dropdown',     destCol: 'Equipment',     transform: null },  // "I'm interested in"
-  // { cf7Key: 'product',      destCol: 'Equipment',     transform: null },  // "I'm interested in"
-  { cf7Key: 'country',      destCol: 'Country',       transform: null },
-  // { cf7Key: 'message',      destCol: 'Notes',         transform: null },
-  // { cf7Key: 'checkbox',     destCol: 'Pref. Contact', transform: null },  // "Preferred Contact Method"
-  // { cf7Key: 'page-title',   destCol: 'Page Title',    transform: null },  // page the form was submitted from
-  // { cf7Key: 'form-name',    destCol: 'Source Form',   transform: null },  // CF7 form title (verify header, may differ)
-  // ── Add/remove rows here as forms evolve ──
-];
-
-// Hard-coded values written to dest regardless of source data
-const FIELD_DEFAULTS = {
-  'Status': '4 - New Lead',
-  // 'Rep': 'Unassigned',  // ← uncomment & set if needed
-};
-
-// ─────────────────────────────────────────────
-//  SECTION 3 — TRANSFORM HELPERS
-//  Add new ones here and reference in FIELD_MAP
-// ─────────────────────────────────────────────
-
-/** Prefix phone with apostrophe so Sheets treats it as text */
 function forcePhoneString(val) {
-  return val && val !== '' ? "'" + val : val;
+  if (!val || val === '') return val;
+  const s = val.toString().trim();
+  return s.startsWith("'") ? s : "'" + s;
 }
 
-/** Example: trim + title-case a name */
-function titleCase(val) {
-  if (!val) return val;
-  return val.toString().trim().replace(/\w\S*/g, w => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase());
-}
+// Dest column header → auto-applied transform function
+const AUTO_TRANSFORMS = {
+  'Phone Number': forcePhoneString,
+};
 
 // ─────────────────────────────────────────────
-//  SECTION 4 — TRIGGER FUNCTIONS
-//  Point your installable triggers at these
+//  CONFIG TAB READER
 // ─────────────────────────────────────────────
 
 /**
- * AUTO-CHECKBOX
- * Trigger: Time-driven → every minute → onNewCF7Row
+ * Reads the config tab and returns:
+ * {
+ *   settings: { sourceTab, destSheetId, destTab, timezone, followUpDays, dupFields[] }
+ *   fieldConfig: [{ cf7Key, destCol, defaultVal }, ...]
+ * }
  *
- * Scans all data rows for missing checkboxes and fills them in.
- * More reliable than INSERT_ROW change event for third-party connectors
- * (CF7, Zapier, etc.) which don't always fire that trigger.
+ * Settings block  → cols A:B, starting row 3 (row 1 = header, row 2 = instruction)
+ * Field map block → cols D:F, starting row 3 (row 1 = header, row 2 = instruction)
  */
+function loadConfig() {
+  const ss          = SpreadsheetApp.getActiveSpreadsheet();
+  const configSheet = ss.getSheetByName(CONFIG_TAB_NAME);
+  if (!configSheet) throw new Error(`Config tab "${CONFIG_TAB_NAME}" not found.`);
+
+  const data = configSheet.getDataRange().getValues();
+
+  // ── Settings (cols A:B, skip rows 0–1) ──
+  const settingsRaw = {};
+  for (let i = 2; i < data.length; i++) {
+    const key = data[i][0] ? data[i][0].toString().trim() : '';
+    const val = data[i][1] !== undefined ? data[i][1] : '';
+    if (key) settingsRaw[key] = val.toString().trim();
+  }
+
+  const settings = {
+    sourceTab:    settingsRaw['Source Tab']     || '',
+    destSheetId:  settingsRaw['Dest Sheet ID']  || '',
+    destTab:      settingsRaw['Dest Tab']        || '',
+    timezone:     settingsRaw['Timezone']        || 'Australia/Adelaide',
+    followUpDays: parseInt(settingsRaw['Follow Up Days']) || 3,
+    dupFields:    settingsRaw['Dup Fields']
+                    ? settingsRaw['Dup Fields'].split(',').map(s => s.trim())
+                    : [],
+    syncTriggerCol: settingsRaw['Sync Trigger Col'] || 'Sync to Leads',
+  };
+
+  // ── Field map (cols D:F, skip rows 0–1) ──
+  const fieldConfig = [];
+  for (let i = 2; i < data.length; i++) {
+    const cf7Key     = data[i][3] ? data[i][3].toString().trim() : '';
+    const destCol    = data[i][4] ? data[i][4].toString().trim() : '';
+    const defaultVal = data[i][5] !== undefined ? data[i][5] : '';
+    if (!destCol) continue; // skip blank/incomplete rows
+    fieldConfig.push({ cf7Key, destCol, defaultVal });
+  }
+
+  return { settings, fieldConfig };
+}
+
+// ─────────────────────────────────────────────
+//  TRIGGER: AUTO-CHECKBOX
+//  Time-driven → every minute
+// ─────────────────────────────────────────────
 function onNewCF7Row() {
+  const { settings } = loadConfig();
+
   const ss    = SpreadsheetApp.getActiveSpreadsheet();
-  const sheet = ss.getSheetByName(CF7_CONFIG.SOURCE_TAB_NAME);
+  const sheet = ss.getSheetByName(settings.sourceTab);
   if (!sheet || sheet.getLastRow() < 2) return;
 
   const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
-  let triggerCol = headers.indexOf(CF7_CONFIG.SYNC_TRIGGER_COL) + 1;
+  let triggerCol = headers.indexOf(settings.syncTriggerCol) + 1;
 
-  // Auto-create the header column if missing
+  // Auto-create the column if missing
   if (triggerCol === 0) {
     triggerCol = sheet.getLastColumn() + 1;
-    sheet.getRange(1, triggerCol).setValue(CF7_CONFIG.SYNC_TRIGGER_COL);
+    sheet.getRange(1, triggerCol).setValue(settings.syncTriggerCol);
   }
 
-  // Scan all data rows — add checkbox only if the cell is empty
-  const lastRow   = sheet.getLastRow();
-  const colValues = sheet.getRange(2, triggerCol, lastRow - 1, 1).getValues();
+  const lastRow = sheet.getLastRow();
+  const colVals = sheet.getRange(2, triggerCol, lastRow - 1, 1).getValues();
 
-  const toFill = [];
-  colValues.forEach((r, i) => {
-    if (r[0] === '' || r[0] === null) toFill.push(i + 2); // +2: 1-indexed + skip header
-  });
-
-  toFill.forEach(r => {
-    sheet.getRange(r, triggerCol).insertCheckboxes().setBackground('#f3f3f3');
+  colVals.forEach((r, i) => {
+    if (r[0] === '' || r[0] === null) {
+      sheet.getRange(i + 2, triggerCol).insertCheckboxes().setBackground('#f3f3f3');
+    }
   });
 }
 
-/**
- * SYNC ON CHECKBOX TICK
- * Trigger: On edit → installableOnEdit
- */
+// ─────────────────────────────────────────────
+//  TRIGGER: SYNC ON CHECKBOX TICK
+//  On edit
+// ─────────────────────────────────────────────
 function installableOnEdit(e) {
   if (!e || e.value !== 'TRUE') return;
 
-  const sheet = e.range.getSheet();
-  if (sheet.getName() !== CF7_CONFIG.SOURCE_TAB_NAME) return;
+  let settings;
+  try {
+    ({ settings } = loadConfig());
+  } catch (err) {
+    SpreadsheetApp.getUi().alert('Config Error', err.message, SpreadsheetApp.getUi().ButtonSet.OK);
+    return;
+  }
 
-  const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
-  const triggerCol = headers.indexOf(CF7_CONFIG.SYNC_TRIGGER_COL) + 1;
+  const sheet = e.range.getSheet();
+  if (sheet.getName() !== settings.sourceTab) return;
+
+  const headers    = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+  const triggerCol = headers.indexOf(settings.syncTriggerCol) + 1;
   if (e.range.getColumn() !== triggerCol) return;
 
   e.range.setBackground('#fff2cc').setValue('Syncing...');
   SpreadsheetApp.flush();
 
-  syncRow(e.range.getRow(), sheet, headers, e.range);
+  syncRow(e.range.getRow(), sheet, headers, e.range, settings);
 }
 
 // ─────────────────────────────────────────────
-//  SECTION 5 — CORE SYNC LOGIC
-//  No need to edit unless the Leads sheet structure changes
+//  CORE SYNC
 // ─────────────────────────────────────────────
-
-function syncRow(row, srcSheet, srcHeaders, triggerCell) {
+function syncRow(row, srcSheet, srcHeaders, triggerCell, settings) {
   const ui = SpreadsheetApp.getUi();
 
-  // Build key→value map from source row
   const srcValues = srcSheet.getRange(row, 1, 1, srcSheet.getLastColumn()).getValues()[0];
-  const srcData = {};
+  const srcData   = {};
   srcHeaders.forEach((h, i) => { if (h) srcData[h] = srcValues[i]; });
 
-  // Helper: look up a CF7 value by cf7Key
-  const getCF7Val = (cf7Key) => {
-    const entry = FIELD_MAP.find(f => f.cf7Key === cf7Key);
-    if (!entry) return '';
-    let val = srcData[cf7Key] !== undefined ? srcData[cf7Key] : '';
-    return entry.transform ? entry.transform(val) : val;
-  };
+  let fieldConfig;
+  try {
+    ({ fieldConfig } = loadConfig());
+  } catch (err) {
+    ui.alert('Config Error', err.message, ui.ButtonSet.OK);
+    triggerCell.setValue(false).setBackground('#f4cccc');
+    return;
+  }
 
-  // Formatted timestamps
+  const fmtDate  = (d, fmt) => Utilities.formatDate(d, settings.timezone, fmt);
   const now      = new Date();
-  const fmtDate  = (d, fmt) => Utilities.formatDate(d, CF7_CONFIG.TIMEZONE, fmt);
   const dateStr  = fmtDate(now, 'dd/MM/yyyy HH:mm');
-  const followUp = fmtDate(new Date(now.getTime() + CF7_CONFIG.FOLLOW_UP_DAYS * 86400000), 'dd/MM/yyyy');
+  const followUp = fmtDate(new Date(now.getTime() + settings.followUpDays * 86400000), 'dd/MM/yyyy');
 
   try {
-    const destSS    = SpreadsheetApp.openById(CF7_CONFIG.DEST_SHEET_ID);
-    const destSheet = destSS.getSheetByName(CF7_CONFIG.DEST_TAB_NAME);
-    if (!destSheet) throw new Error(`Dest tab "${CF7_CONFIG.DEST_TAB_NAME}" not found.`);
+    const destSS    = SpreadsheetApp.openById(settings.destSheetId);
+    const destSheet = destSS.getSheetByName(settings.destTab);
+    if (!destSheet) throw new Error(`Dest tab "${settings.destTab}" not found.`);
 
     const destHeaders = destSheet.getRange(1, 1, 1, destSheet.getLastColumn()).getValues()[0];
     const destData    = destSheet.getDataRange().getValues();
 
     // ── Duplicate check ──
-    for (const dupField of CF7_CONFIG.DUP_FIELDS) {
+    for (const dupField of settings.dupFields) {
       const destColIdx = destHeaders.indexOf(dupField);
-      const mapEntry   = FIELD_MAP.find(f => f.destCol === dupField);
-      if (destColIdx === -1 || !mapEntry) continue;
+      const mapEntry   = fieldConfig.find(f => f.destCol === dupField);
+      if (destColIdx === -1 || !mapEntry || !mapEntry.cf7Key) continue;
 
       const incomingVal = srcData[mapEntry.cf7Key];
       if (!incomingVal) continue;
 
       let isDup = false;
-
       if (dupField === 'Phone Number') {
-        const cleanPhone = (p) => p ? p.toString().split(/[\/,]/).map(x => x.replace(/\D/g, '')).filter(x => x.length > 7) : [];
-        const incomingNums = cleanPhone(incomingVal);
-        isDup = destData.some((r, i) => i > 0 && incomingNums.some(p => cleanPhone(r[destColIdx]).includes(p)));
+        const clean = p => p ? p.toString().split(/[\/,]/).map(x => x.replace(/\D/g, '')).filter(x => x.length > 7) : [];
+        isDup = destData.some((r, i) => i > 0 && clean(incomingVal).some(p => clean(r[destColIdx]).includes(p)));
       } else {
         isDup = destData.some((r, i) => i > 0 &&
           r[destColIdx].toString().toLowerCase().trim() === incomingVal.toString().toLowerCase().trim());
@@ -208,21 +217,19 @@ function syncRow(row, srcSheet, srcHeaders, triggerCell) {
 
     // ── Build destination row ──
     const newRow = destHeaders.map(destHeader => {
-      // Auto fields
       if (destHeader === 'Date')      return dateStr;
       if (destHeader === 'Follow Up') return followUp;
 
-      // Check FIELD_MAP
-      const mapEntry = FIELD_MAP.find(f => f.destCol === destHeader);
-      if (mapEntry) {
-        const raw = srcData[mapEntry.cf7Key];
-        return mapEntry.transform ? mapEntry.transform(raw) : (raw !== undefined ? raw : '');
-      }
+      const entry = fieldConfig.find(f => f.destCol === destHeader);
+      if (!entry) return '';
 
-      // Check DEFAULTS
-      if (FIELD_DEFAULTS[destHeader] !== undefined) return FIELD_DEFAULTS[destHeader];
+      let val = (entry.cf7Key && srcData[entry.cf7Key] !== undefined && srcData[entry.cf7Key] !== '')
+        ? srcData[entry.cf7Key]
+        : entry.defaultVal;
 
-      return '';
+      if (AUTO_TRANSFORMS[destHeader]) val = AUTO_TRANSFORMS[destHeader](val);
+
+      return val;
     });
 
     destSheet.appendRow(newRow);
